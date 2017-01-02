@@ -12,17 +12,22 @@ import time
 import sys
 from modules.worker import WorkerThread, WorkerTasks
 from argparse import RawTextHelpFormatter
+import matplotlib.pyplot as plt
+
 
 throughput= 0.0
 agrigateThroughput = 0.0
+throuputARR = []
 start_time = 0
 done = False
 max_wait = 0.0
-time_to_clear_queue= 1
+time_to_clear_queue= 0.1 #in seconds
 consumed_workflows = []
 produced_workflows = []
 dropped_workflows = []
-
+started_posting = False
+done_recusively_queue_clearing = True
+cleared_amqp_msgs = 0
 
 def signal_handler(signum,stack):
     global done
@@ -32,29 +37,36 @@ def signal_handler(signum,stack):
 signal.signal(signal.SIGINT, signal_handler)
 
 def handle_graph_finish(body, message):
-    global consumed_workflows, produced_workflows, max_wait
+    global consumed_workflows, produced_workflows, max_wait, done_recusively_queue_clearing, cleared_amqp_msgs
 
-    temp_dict = {}
-    routeId = message.delivery_info.get('routing_key').split('graph.finished.')[1]
-    assert_not_equal(routeId, None)
-    message.ack()
-    temp_dict['time_stamp']= time.time()
-    temp_dict['graph_id']= routeId
-    consumed_workflows.append(temp_dict)
-    graph_wait = 0
-    for index, item in enumerate(produced_workflows):
-        if item["graph_id"] == routeId:
-            graph_wait =  temp_dict['time_stamp'] - item['time_stamp']
-            break
-    if (max_wait < graph_wait):
-        max_wait = graph_wait
+    if (started_posting == True):
+        temp_dict = {}
+        routeId = message.delivery_info.get('routing_key').split('graph.finished.')[1]
+        assert_not_equal(routeId, None)
+        message.ack()
+        temp_dict['time_stamp']= time.time()
+        temp_dict['graph_id']= routeId
+        consumed_workflows.append(temp_dict)
+        graph_wait = 0
+        for index, item in enumerate(produced_workflows):
+            if item["graph_id"] == routeId:
+                graph_wait =  temp_dict['time_stamp'] - item['time_stamp']
+                break
+        if (max_wait < graph_wait):
+            max_wait = graph_wait
+    else:
+        cleared_amqp_msgs = cleared_amqp_msgs + 1
+        done_recusively_queue_clearing = False
+        message.ack()
 
-def post_function(TOTAL_WORKFLOWS):
-    global consumed_workflows, produced_workflows, dropped_workflow, start_time
+
+def post_function(TOTAL_WORKFLOWS, API):
+    global consumed_workflows, produced_workflows, dropped_workflow, start_time, started_posting
+    started_posting = True
     start_time = time.time()
     for n in range(TOTAL_WORKFLOWS):
         temp_dict= {}
-        r = post('/workflows?name=Graph.noop-example')
+        r = post('/workflows?name=Graph.noop-example',API)
         graphId =  json.loads(r._content)["instanceId"]
         temp_dict['time_stamp'] = time.time()
         temp_dict['graph_id'] = graphId
@@ -66,6 +78,7 @@ def post_function(TOTAL_WORKFLOWS):
             produced_workflows.append(temp_dict)
 
 def print_function(REFRESH_RATE):
+    global done
     while 1:
         if(done == False):
             cw_length = len(consumed_workflows)
@@ -84,7 +97,7 @@ def print_function(REFRESH_RATE):
             break
 
 def analyze_function(TOTAL_WORKFLOWS, SAMPLING_WINDOW):
-    global consumed_workflows, produced_workflows, dropped_workflows, throughput, agrigateThroughput
+    global consumed_workflows, produced_workflows, dropped_workflows, throughput, agrigateThroughput, throuputARR
     global start_time, done
     start_time = time.time()
     lastTime = time.time()
@@ -100,11 +113,12 @@ def analyze_function(TOTAL_WORKFLOWS, SAMPLING_WINDOW):
         if( deltaTime >= SAMPLING_WINDOW and deltaWorkflows > 0 ):
             lastTime = currentTime
             throughput =  deltaWorkflows / (deltaTime)
+            throuputARR.append(float("%.2f" % throughput))
             last_consumed_workflows = cw_length
             agrigateThroughput = cw_length/ (currentTime - start_time)
 
 
-        if(pw_length == TOTAL_WORKFLOWS and  cw_length == TOTAL_WORKFLOWS):
+        if( cw_length == TOTAL_WORKFLOWS):
             amqp_listner_worker.stop()
             break
 
@@ -123,30 +137,35 @@ if __name__ == '__main__':
         """)
         parser.add_argument('-RR','--refresh_rate', type=int, default=15, required=False,
                             help="The refresh rate of the screen(per sec), default value is 15")
-        parser.add_argument('-TF','--total_workflows', type=int, default=20, required=False,
+        parser.add_argument('-TW','--total_workflows', type=int, default=20, required=False,
                             help="Total number of workflows that will be posted, default value is: 20")
         parser.add_argument('-H','--host', default='localhost:8080', required=False,
                             help="RackHD IP:PORT, default is: localhost:8080 ")
         parser.add_argument('-SW','--sampling_window', type=int, default=3.0, required=False,
                             help="The period over which it is used to calculate the throughput, default value: 3.0 sec")
+        parser.add_argument('-A', '--api', default="1.1", required=False,
+                            help="Desired RackHD api")
         args = parser.parse_args()
 
         REFRESH_RATE = args.refresh_rate
         TOTAL_WORKFLOWS = args.total_workflows
         HOST = args.host
         SAMPLING_WINDOW = args.sampling_window
+        API = args.api
 
     amqp_listner_worker = AMQPWorker(queue=QUEUE_GRAPH_FINISH, callbacks=[handle_graph_finish])
-    BASE_URL = 'http://{0}/api/1.1'.format(HOST)
+    BASE_URL = 'http://{0}/api/{1}'.format(HOST, API)
 
-    def post(path, data=None, headers=None):
-        return requests.post(BASE_URL + path, data, headers=headers)
+    def post(path, API,  data=None, headers=None):
+        r = BASE_URL + path
+        headers= {'Content-Type': 'application/json'}
+        return requests.post(r, data, headers=headers)
 
     def thread_func(worker, id):
         worker.start()
 
     def run():
-        post_worker = Thread(target=post_function,args=(TOTAL_WORKFLOWS,))
+        post_worker = Thread(target=post_function,args=(TOTAL_WORKFLOWS, API))
         analyzer_worker = Thread(target=analyze_function, args=(TOTAL_WORKFLOWS,SAMPLING_WINDOW))
         printing_worker = Thread(target=print_function, args=[REFRESH_RATE])
         printing_worker.daemon = True
@@ -157,15 +176,36 @@ if __name__ == '__main__':
         post_worker.start()
         amqp_listner_worker.start()
 
-    def clear_queue():
+
+    def clear_queue(counter):
+        global done_recusively_queue_clearing
         task = WorkerThread(amqp_listner_worker, 'amqp')
         tasks = WorkerTasks(tasks=[task], func=thread_func)
-        print'Clearing the graph.finished queue...'
         tasks.run()
         tasks.wait_for_completion(time_to_clear_queue)
 
-    clear_queue()
+        if(counter < 10 and done_recusively_queue_clearing == False):
+            done_recusively_queue_clearing = True
+            counter = counter + 1
+            clear_queue(counter)
+
+    def plot():
+        x2 = range(len(throuputARR))
+        plot1, = plt.plot(x2, throuputARR, 'r')
+        plt.title("Performance workflows/second")
+        print throuputARR
+        plt.show()
+
+    counter = 0
+    start = time.time()
+    print'Clearing the graph.finished queue...'
+    clear_queue(counter)
+    end = time.time()
+    print "cleared " + str(cleared_amqp_msgs) + " amqp message(s) in " + str(end-start) + " sec"
+    print "running ...."
     run()
-    sys.exit(0)
+    plot()
+
+    #sys.exit(0)
 
 
